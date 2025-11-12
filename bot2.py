@@ -9,212 +9,150 @@ import torch
 from torchvision import models, transforms
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
-# === KONFIGURASI ===
+# === CONFIG ===
 CSV_FILE = "laptops_all_indonesia_fixed_v7.csv"
-OUTPUT_DIR = "gambar_laptop_v8"
+OUTPUT_DIR = "gambar_laptop_v8_fixed"
 FAILED_JSON = "failed_downloads.json"
-WAIT_TIME = 4
-MAX_IMAGES_PER_SOURCE = 3
-
+WAIT_TIME = 5
+MAX_IMAGES = 3
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# === LOAD MODEL DETEKSI LAPTOP ===
-print("🧠 Memuat model deteksi laptop (ResNet50, pretrained ImageNet)...")
+# === SANITIZE FILE NAME ===
+def safe_filename(name):
+    return "".join(c if c.isalnum() or c in (" ", "_", "-") else "_" for c in name).strip()
+
+# === LOAD MODEL ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_cnn = models.resnet50(pretrained=True).to(device)
-model_cnn.eval()
-
-LABELS_URL = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
-LABELS = requests.get(LABELS_URL).text.splitlines()
-
+model = models.resnet50(pretrained=True).to(device)
+model.eval()
+LABELS = requests.get("https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt").text.splitlines()
 preprocess = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
 ])
 
-def is_laptop_image(img_bytes):
-    """Cek apakah gambar termasuk kategori laptop"""
+def is_laptop(img_bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        input_tensor = preprocess(img).unsqueeze(0).to(device)
-        with torch.no_grad():
-            outputs = model_cnn(input_tensor)
-            _, indices = torch.sort(outputs, descending=True)
-            top5 = [LABELS[idx] for idx in indices[0][:5]]
-        if any(word in str(top5).lower() for word in
-               ["laptop", "notebook", "computer", "keyboard", "display", "monitor", "macbook"]):
-            return True
-        return False
-    except Exception:
-        return False
+        inp = preprocess(img).unsqueeze(0).to(device)
+        with torch.no_grad(): preds = model(inp)
+        top5 = [LABELS[i] for i in preds[0].topk(5).indices]
+        return any(k in str(top5).lower() for k in ["laptop","notebook","macbook","computer"])
+    except: return False
 
+# === SELENIUM SETUP ===
+def start_browser():
+    opts = Options()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--headless=new")
+    opts.add_argument("window-size=1280,1024")
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
-# === SETUP SELENIUM ===
-options = Options()
-options.add_argument("start-maximized")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument(
-    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+driver = start_browser()
 
+def restart_browser():
+    global driver
+    try: driver.quit()
+    except: pass
+    driver = start_browser()
 
-def save_as_jpg(url, filename):
-    """Download dan simpan gambar ke format JPG"""
-    try:
-        r = requests.get(url, timeout=10)
-        if not is_laptop_image(r.content):
-            print(f"🚫 {os.path.basename(filename)} dilewati (bukan laptop)")
-            return False
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        filename = filename.rsplit(".", 1)[0] + ".jpg"
-        img.save(filename, "JPEG", quality=90)
-        print(f"✅ {os.path.basename(filename)} tersimpan.")
-        return True
-    except Exception as e:
-        print(f"⚠️ Gagal menyimpan {filename}: {e}")
-        return False
-
-
-# === MESIN PENCARI ===
-def get_google_images(query, max_images=3):
-    search_url = f"https://www.google.com/search?q={query}+laptop&tbm=isch"
-    driver.get(search_url)
+# === IMAGE SEARCHERS ===
+def google_images(q):
+    driver.get(f"https://www.google.com/search?q={q}+laptop&tbm=isch")
     time.sleep(WAIT_TIME)
-    thumbs = driver.find_elements(By.CSS_SELECTOR, "img.Q4LuWd, img.YQ4gaf, img.rg_i")
-    results = []
-    for idx, thumb in enumerate(thumbs[:max_images]):
+    urls=[]
+    for el in driver.find_elements(By.CSS_SELECTOR,"img.Q4LuWd")[:MAX_IMAGES]:
         try:
-            thumb.click()
-            time.sleep(WAIT_TIME)
-            srcs = driver.find_elements(By.CSS_SELECTOR, "img.n3VNCb")
+            el.click(); time.sleep(WAIT_TIME)
+            srcs=driver.find_elements(By.CSS_SELECTOR,"img.n3VNCb")
             for s in srcs:
-                url = s.get_attribute("src")
-                if url and url.startswith("http") and "data:image" not in url:
-                    results.append(url)
-                    break
-        except Exception:
-            continue
-    return results
+                u=s.get_attribute("src")
+                if u and u.startswith("http"): urls.append(u); break
+        except: continue
+    return urls
 
-def get_bing_images(query, max_images=3):
-    url = f"https://www.bing.com/images/search?q={query}+laptop"
-    driver.get(url)
+def bing_images(q):
+    driver.get(f"https://www.bing.com/images/search?q={q}+laptop")
     time.sleep(WAIT_TIME)
-    results = []
-    try:
-        imgs = driver.find_elements(By.CSS_SELECTOR, "img.mimg")
-        for i in imgs[:max_images]:
-            src = i.get_attribute("src")
-            if src and src.startswith("http"):
-                results.append(src)
-    except Exception:
-        pass
-    return results
+    return [i.get_attribute("src") for i in driver.find_elements(By.CSS_SELECTOR,"img.mimg")[:MAX_IMAGES] if i.get_attribute("src")]
 
-def get_duckduckgo_images(query, max_images=3):
-    url = f"https://duckduckgo.com/?q={query}+laptop&iax=images&ia=images"
-    driver.get(url)
+def duckduckgo_images(q):
+    driver.get(f"https://duckduckgo.com/?q={q}+laptop&iax=images&ia=images")
     time.sleep(WAIT_TIME)
-    results = []
+    return [i.get_attribute("src") for i in driver.find_elements(By.CSS_SELECTOR,"img.tile--img__img")[:MAX_IMAGES] if i.get_attribute("src")]
+
+# === SAVE IMAGE ===
+def save_image(url, fname):
     try:
-        imgs = driver.find_elements(By.CSS_SELECTOR, "img.tile--img__img")
-        for i in imgs[:max_images]:
-            src = i.get_attribute("src")
-            if src and src.startswith("http"):
-                results.append(src)
-    except Exception:
-        pass
-    return results
+        r=requests.get(url,timeout=10)
+        if not r.ok: return False
+        if not is_laptop(r.content): return False
+        img=Image.open(io.BytesIO(r.content)).convert("RGB")
+        img.save(fname,"JPEG",quality=90)
+        return True
+    except: return False
 
+# === MAIN PROCESS ===
+searchers=[("Google",google_images),("Bing",bing_images),("DuckDuckGo",duckduckgo_images)]
+failed=[]
 
-# === PROSES DOWNLOAD DENGAN MULTI-SOURCE ===
-def process_product(query, filename):
-    """Coba download dari Google, Bing, DuckDuckGo"""
-    searchers = [
-        ("Google", get_google_images),
-        ("Bing", get_bing_images),
-        ("DuckDuckGo", get_duckduckgo_images)
-    ]
-
-    for name, func in searchers:
-        print(f"🔍 Mencoba sumber: {name}")
-        urls = func(query, MAX_IMAGES_PER_SOURCE)
-        if not urls:
-            print(f"⚠️ Tidak ada hasil dari {name}")
-            continue
-
-        for idx, url in enumerate(urls, 1):
-            print(f"   🔁 Percobaan gambar ke-{idx}/{MAX_IMAGES_PER_SOURCE} ({name}) ...")
-            if save_as_jpg(url, filename):
-                return True
-            time.sleep(1)
-
-    return False
-
-
-# === UTAMA ===
-failed = []
 if os.path.exists(FAILED_JSON):
-    with open(FAILED_JSON, "r", encoding="utf-8") as f:
-        try:
-            failed = json.load(f)
-        except Exception:
-            failed = []
+    with open(FAILED_JSON,"r",encoding="utf-8") as f:
+        try: failed=json.load(f)
+        except: failed=[]
 
-with open(CSV_FILE, newline='', encoding='utf-8') as csvfile:
-    reader = csv.DictReader(csvfile)
-    count = 0
-
+with open(CSV_FILE,encoding="utf-8") as f:
+    reader=csv.DictReader(f)
     for row in reader:
-        brand = str(row.get("brand", "")).strip()
-        model = str(row.get("model", "")).strip()
-        query = f"{brand} {model}"
-        safe_name = f"{brand}_{model}".replace("/", "_").replace(" ", "_")
-        filename = os.path.join(OUTPUT_DIR, f"{safe_name}.jpg")
-
-        if os.path.exists(filename):
-            print(f"⏭️ Lewati (sudah ada): {filename}")
-            continue
-
-        print(f"\n🔍 Memproses: {query}")
-        ok = process_product(query, filename)
+        q=f"{row.get('brand','')} {row.get('model','')}".strip()
+        fname=os.path.join(OUTPUT_DIR,safe_filename(q)+".jpg")
+        if os.path.exists(fname): continue
+        print(f"\n🔍 Memproses: {q}")
+        ok=False
+        for name,func in searchers:
+            try: urls=func(q)
+            except Exception:
+                restart_browser()
+                urls=[]
+            for i,u in enumerate(urls[:MAX_IMAGES]):
+                print(f"   🔁 {name} percobaan {i+1}")
+                if save_image(u,fname):
+                    print(f"✅ {fname} tersimpan dari {name}")
+                    ok=True; break
+            if ok: break
         if not ok:
-            print(f"❌ Gagal total untuk {query}")
-            failed.append(query)
+            failed.append(q)
+            print(f"❌ Gagal total untuk {q}")
+        if len(failed)%10==0:
+            with open(FAILED_JSON,"w",encoding="utf-8") as f: json.dump(failed,f,indent=2)
 
-        count += 1
-        if count % 10 == 0:
-            with open(FAILED_JSON, "w", encoding="utf-8") as f:
-                json.dump(failed, f, indent=2)
-            print(f"💾 Progress disimpan ({count} produk).")
-
-# === COBA ULANG UNTUK YANG GAGAL ===
+# === RETRY FAILED ===
 if failed:
-    print("\n🔁 Mencoba ulang download gambar yang gagal...")
-    still_failed = []
-    for query in failed:
-        safe_name = query.replace("/", "_").replace(" ", "_")
-        filename = os.path.join(OUTPUT_DIR, f"{safe_name}.jpg")
-        ok = process_product(query, filename)
-        if not ok:
-            still_failed.append(query)
-
-    with open(FAILED_JSON, "w", encoding="utf-8") as f:
-        json.dump(still_failed, f, indent=2)
-
-    print(f"\n📄 {len(still_failed)} produk masih gagal. Daftar disimpan di {FAILED_JSON}")
+    print("\n🔁 Re-download gambar gagal...")
+    retry=[]
+    for q in failed:
+        fname=os.path.join(OUTPUT_DIR,safe_filename(q)+".jpg")
+        ok=False
+        for name,func in searchers:
+            try: urls=func(q)
+            except Exception:
+                restart_browser(); urls=[]
+            for i,u in enumerate(urls[:MAX_IMAGES]):
+                if save_image(u,fname):
+                    ok=True; break
+            if ok: break
+        if not ok: retry.append(q)
+    with open(FAILED_JSON,"w",encoding="utf-8") as f: json.dump(retry,f,indent=2)
+    print(f"📄 Masih gagal: {len(retry)}")
 else:
-    print("\n✅ Semua gambar berhasil diunduh.")
+    print("✅ Semua gambar berhasil diunduh.")
 
 driver.quit()
-print("\n🎉 Selesai! Semua proses multi-source berhasil dijalankan.")
+print("🎉 Selesai.")
